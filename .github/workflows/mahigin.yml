@@ -1,0 +1,80 @@
+name: Multi-OS Workflow with Ubuntu and Windows Server 2025
+
+on:
+  workflow_dispatch:
+
+jobs:
+
+  ubuntu-job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show Ubuntu info
+        run: |
+          echo "Running on Ubuntu runner"
+          uname -a
+          # Alte comenzi Ubuntu pot fi adaugate aici
+
+  windows-server-job:
+    runs-on: windows-2025
+    steps:
+      - name: Setup VM with Tailscale and RDP
+        shell: powershell
+        id: setup_vm
+        run: |
+          $vmName = "Win2025-Tailscale-RDP"
+          $vmRam = 64GB
+          $vmCpu = 8
+          $vmDisk = "C:\HyperV\VirtualHardDisks\$vmName.vhdx"
+          $vmDiskSizeBytes = 1099511627776 # 1TB
+
+          if (-not (Test-Path (Split-Path $vmDisk))) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $vmDisk)
+          }
+          New-VHD -Path $vmDisk -SizeBytes $vmDiskSizeBytes -Dynamic
+          New-VM -Name $vmName -MemoryStartupBytes $vmRam -Generation 2 -NewVHDPath $vmDisk
+          Set-VMProcessor -VMName $vmName -Count $vmCpu
+
+          Start-VM -Name $vmName
+          Write-Host "VM started, waiting 15 minutes"
+          Start-Sleep -Seconds 900
+
+          $rdpUser = "rdpuser"
+          $rdpPass = [System.Web.Security.Membership]::GeneratePassword(16,3)
+
+          Invoke-Command -VMName $vmName -ScriptBlock {
+            param($user, $pass, $authKey)
+            New-LocalUser -Name $user -Password (ConvertTo-SecureString $pass -AsPlainText -Force) -FullName "RDP User" -Description "User for RDP Access"
+            Add-LocalGroupMember -Group "Administrators" -Member $user
+            Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+            Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+            Invoke-WebRequest -Uri "https://tailscale.com/install.ps1" -UseBasicParsing | Invoke-Expression
+            tailscale up --authkey=$authKey --accept-routes
+            Start-Sleep -Seconds 20
+            $ip = tailscale ip -4
+            Write-Output "Tailscale IP: $ip"
+            [PSCustomObject]@{IP=$ip;User=$user;Password=$pass} | ConvertTo-Json
+          } -ArgumentList $rdpUser, $rdpPass, '${{ secrets.TAILSCALE_AUTHKEY }}' -OutVariable result
+
+          $resJson = $result[-1]
+          Write-Host "RDP+Tailscale Info: $resJson"
+          $parsed = $resJson | ConvertFrom-Json
+          Write-Output "::set-output name=TAILSCALE_IP::$($parsed.IP)"
+          Write-Output "::set-output name=RDP_USER::$($parsed.User)"
+          Write-Output "::set-output name=RDP_PASS::$($parsed.Password)"
+
+      - name: Run VM for 6 hours
+        shell: powershell
+        run: Start-Sleep -Seconds 21600
+
+      - name: Stop VM
+        shell: powershell
+        run: |
+          Stop-VM -Name "Win2025-Tailscale-RDP" -Force
+          Write-Host "VM stopped after 6 hours"
+
+      - name: Show connection info
+        run: |
+          echo "Tailscale IP: ${{ steps.setup_vm.outputs.TAILSCALE_IP }}"
+          echo "RDP User: ${{ steps.setup_vm.outputs.RDP_USER }}"
+          echo "RDP Password: ${{ steps.setup_vm.outputs.RDP_PASS }}"
+          
